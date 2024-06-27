@@ -149,15 +149,15 @@ def rms_norm_gated(
 @jaxtyped(typechecker=typechecker)
 def segsum(x: Float[Array, '*b l']) -> Float[Array, '*b l l']:
     """
-    we need to compute the 1-SS matrix which for a sequence [ x_1, ..., x_l ]
-    is a lower triangular matrix M of shape (n, n), with diagonal elements 1
+    computes the 1-SS matrix for a sequence [ x_1, ..., x_l ] which is a
+    lower triangular matrix M of shape (n, n) having diagonal elements 1
     and for all 2 <= i <= l and 1 <= j < i, M_ij = x_1 * ... * x_{i - j}
 
     this causes numerical issues for large l, so we compute the cumulative sums
-    by taking the log of x. this is assumed to be already done, before calling
-    the function. we exp the output of this function to get the 1-SS matrix
+    for log(x) instead of cumulative products for x. the input is assumed to be
+    log of the sequence(s). we exp the output of the function to get the matrix
 
-    if x is the sequence we want to compute the 1-SS matrix for, we do
+    if x is the sequence whose 1-SS matrix we want to compute, we do
 
     M = jnp.exp(segsum(jnp.log(x)))
     """
@@ -185,125 +185,36 @@ def ssd(
         D: Float[Array, 'nh']
     ) -> Float[Array, 'l d']:
     """
-    tl;dr:
+    recommend reading https://goombalab.github.io/blog/2024/mamba2-part1-model/
 
-    we choose a structure for the SSM matrices that allow us to turn it into an attention
-    analogue. the end result looks like removing the softmax in attention and using a special
-    mask that allows for fast parallel training with quadratic complexity (like transformers)
-    and fast inference with linear complexity (like RNNs)
+    tl;dr
 
-    Args:
-        dt: the step size for each position for each head 
-        x: input tensor split into nh channel groups (heads)
-        A: the state matrices. the matrix is a scalar for each head shared across positions
-        B: the input matrices. the matrix is a vector for each position shared across heads
-        C: the output matrices. the matrix is a vector for each position shared across heads
-        D: the feedforward matrices. the matrix is a scalar for each head shared across positions
-    
-    consider the SSM for a single channel of an embedding sequence. it is a sequence to sequence 
-    map (l,) -> (l,) using structured matrices A, B, and C of shapes (l,), (l, n), and (l, n)
-    respectively where n is d_state. the 1-SS matrix M of shape (l, l) transforms the loop
-    
+    we impose a structure on the SSM matrices A, B, and C that allows us to transform
+    the sequential computation into a matrix multiplication. the result is an attention
+    analogue with a special mask and without the softmax
+
+    for a single channel of an embedding sequence, the 1-SS matrix M transforms
+   
     y = []
     h = jnp.zeros(n)
-    for a_t, B_t, C_t in zip(A, B, C):
+    for x_t, a_t, B_t, C_t in zip(x, A, B, C):
         h = a_t * h + B_t * x_t  # () * (n,) + (n,) * () = (n,)
         y.append(h @ C_t.T)  # (n,) @ (n,).T = ()
     y = jnp.array(y)  # (l,)
 
-    into a single matrix multiplication
-
-    y = M @ x  # (l, l) @ (l,) = (l,)
-
-    we see below how. the tensors involved are
-    
-    x_t: ()
-    a_t: ()
-    B_t: (n,)  
-    C_t: (n,)
-
-    the recurrence as seen above is
-
-    H_t = a_t * H_{t - 1} + B_t * x_t  # (n,)
-    y_t = H_t @ C_t^T  # ()
-
-    where a_t, B_t, and C_t are shared across channels and are discretized before computing the recurrence
-
-    we can expand the recurrence to see a pattern
-
-    H_{-1} = 0  # (n,)
-    
-    H_0 = a_0 * H_{-1} + B_0 * x_0
-    ...
-    H_{l - 1} = a_{l - 1} * H_{l - 2} + B_{l - 1} * x_{l - 1}  # l hidden states
-    
-    expanding from H_{l - 1}
-
-    H_{l - 1} = a_{l - 1} * (a_{l - 2} * H_{l - 3} + B_{l - 2} * x_{l - 2}) + B_{l - 1} * x_{l - 1}
-              = (a_{l - 1} * a_{l - 2}) * H_{l - 3} + a_{l - 1} * B_{l - 2} * x_{l - 2} + B_{l - 1} * x_{l - 1}
-
-    expanding until we get to H_{-1}, we have 
-              
-    H_{l - 1} = (a_{l - 1} * ... * a_0) * H_{-1} + (a_{l - 1} * ... * a_1) * B_0 * x_0
-                                                 + (a_{l - 1} * ... * a_2) * B_1 * x_1
-                                                 ...
-                                                 + (a_{l - 1} * a_{l - 2}) * B_{l - 3} * x_{l - 3}
-                                                 + a_{l - 1} * B_{l - 2} * x_{l - 2}
-                                                 + B_{l - 1} * x_{l - 1}
-    
-    then we do the read out
-    
-    y_l = H_{l - 1} @ C_{l - 1}^T
-
-    since H_{-1} = 0 we have
-
-    y_l = (a_{l - 1} * ... * a_1) * C_{l - 1} @ B_0^T * x_0 +
-          (a_{l - 1} * ... * a_2) * C_{l - 1} @ B_1^T * x_1 +
-          ...
-          (a_{l - 1} * a_{l - 2}) * C_{l - 1} @ B_{l - 3}^T * x_{l - 3} +
-          a_{l - 1} * C_{l - 1} @ B_{l - 2}^T * x_{l - 2} +
-          C_{l - 1} @ B_{l - 1}^T * x_{l - 1}
-
-    for example
-
-    H_3 = a_3 * a_2 * a_1 * (C_3 @ B_0^T) * x_0 + 
-          a_3 * a_2 * (C_3 @ B_1^T) * x_1 +
-          a_3 * (C_3 @ B_2^T) * x_2 + 
-          (C_3 @ B_3^T) * x_3
-
-    if you look carefully, you can see that it is equivalent to a masked and weighted query-key dot product
-    where C is analogous Q and B is analogous to K. the mask for y_t is 
-
-                                0                                           t - 1    t        l - 1
-                                |                                             |      |          |       
-    MASK_{t - 1} = [ (a_1 * ... * a_{t - 1}), ..., a_{t - 2} * a_{t - 1}, a_{t - 1}, 1, 0, ..., 0 ]
-
-    let L = [ MASK_0,
-              MASK_1,
-              ...,
-              MASK_{l - 1} ]   # weighted mask
-     
-          = [ [ 1, 0, 0, ..., 0 ],
-              [ a_1, 1, 0, ..., 0 ],
-              [ a_1 * a_2, a_1, 1, ..., 0 ],
-              ...
-              [ (a_1 * ... * a_{l - 1}), ..., 1 ] ]  # (l, l)
-
-    L is the 1-semiseparable (1-SS) matrix
-
-    the SSM matrix is now
-
-    M = L * (C @ B^T)  # (l, l) * ((l, n) @ (l, n).T) = (l, l)
-
-    now given a sequence x of shape (l,)
+    into
 
     y = M @ x
 
-    is the SSM output
+    where x, A, B, and C are of shapes (l,), (l,), (l, n), (l, n)
 
-    if x is of shape (l, dh) (multiple channels), the same equation applies
+    the computation can be shared across dh channels, in which case the shapes are
+    (l, dh), (l,), (l, n), (l, n)
+
+    there can be nh such channel groups (heads) each with dh channels, and nh * dh
+    is the sequence embedding dimension
     """
-    
+
     # split heads
     x = rearrange(x, 'l (nh dh) -> nh l dh', nh=A.shape[-1])
 
@@ -416,3 +327,25 @@ def mamba2_step(args, valid_logits, params, token, cache):
     logits = rms_norm_gated(params.norm_f, x, None) @ params.embedding.T
 
     return logits[:args.orig_vocab_size if valid_logits else args.vocab_size], cache
+
+
+def generate(key, args, params, steps, temperature, prompt, cache=None):
+    print(prompt, end='')
+    
+    f = jit(partial(mamba2_step, args, True, params))
+
+    tokens = jnp.array(encode(prompt))
+
+    for token in tokens:
+        logits, cache = f(token, cache)
+  
+    token = random.categorical(key, logits / temperature)
+    print(itoc[int(token)], end='')
+
+    for _ in range(steps):
+        key, subkey = random.split(key)
+        logits, cache = f(token, cache)
+        token = random.categorical(subkey, logits / temperature)
+        print(itoc[int(token)], end='')
+    
+    return cache
