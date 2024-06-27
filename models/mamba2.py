@@ -279,7 +279,8 @@ def mamba2_step(args, valid_logits, params, token, cache):
         
         # (d_inner,), (conv_dim,), (n_heads,)
         z, xBC, dt = jnp.split(zxBCdt, [args.d_inner, args.d_inner + args.conv_dim], -1)
-        
+
+        # conv step
         conv_input = jnp.concatenate([conv_cache, xBC[:, None]], -1)  # (conv_dim, d_conv)
         kernel = jnp.flip(params.conv, -1)  # (conv_dim, d_conv)
         xBC = nn.silu(jnp.vecdot(conv_input, kernel) + zero_or(params.conv_bias))
