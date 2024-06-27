@@ -159,7 +159,7 @@ def segsum(x: Float[Array, '*b l']) -> Float[Array, '*b l l']:
 
     if x is the sequence we want to compute the 1-SS matrix for, we do
 
-    M = jnp.exp(segsum(jnp.log(z)))
+    M = jnp.exp(segsum(jnp.log(x)))
     """
 
     l = x.shape[-1]
